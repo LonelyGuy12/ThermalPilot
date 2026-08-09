@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../utils/model_downloader.dart';
+import 'chat_screen.dart';
 import 'dashboard_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -175,6 +176,8 @@ class _HomeScreenState extends State<HomeScreen>
                   ),
                   const SizedBox(height: 36),
                   _buildStartButton(),
+                  const SizedBox(height: 12),
+                  _buildChatButton(),
                   const SizedBox(height: 40),
                   _buildHintCard(),
                 ],
@@ -182,6 +185,18 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────────
+
+  void _openChat() {
+    // Use whichever model is available — prefer INT4 for lower memory
+    final modelPath = _resolvedInt4Path;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(modelPath: modelPath),
       ),
     );
   }
@@ -540,7 +555,34 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  Widget _buildChatButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 52,
+      child: OutlinedButton.icon(
+        onPressed: _canStart ? _openChat : null,
+        style: OutlinedButton.styleFrom(
+          foregroundColor:
+              _canStart ? Colors.deepPurpleAccent : Colors.white24,
+          side: BorderSide(
+            color: _canStart
+                ? Colors.deepPurpleAccent.withValues(alpha: 0.6)
+                : Colors.white12,
+          ),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+        icon: const Icon(Icons.chat_bubble_outline, size: 20),
+        label: const Text(
+          'Chat with Model',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+
   Widget _buildHintCard() {
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
