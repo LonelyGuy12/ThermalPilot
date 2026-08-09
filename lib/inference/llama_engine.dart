@@ -1,18 +1,17 @@
-/// LlamaEngine — wraps llama_cpp_dart with:
-///   • Hot-swap between INT4 and INT8 GGUF models
-///   • Runtime thread-count changes (via fast model reload for 0.5B models)
+/// LlamaEngine — wraps llama_cpp_dart 0.9.0-dev with:
+///   • Hot-swap between INT4 and INT8 GGUF models (engine re-spawn on policy change)
+///   • Runtime thread-count changes via ContextParams.nThreads
 ///   • Token-per-second measurement during a rotating prompt benchmark loop
+///   • Off-thread inference via llama_cpp_dart's built-in isolate worker
 library;
 
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-import 'package:llama_cpp_dart/llama_cpp_dart.dart';
+import 'package:llama_cpp_dart/llama_cpp_dart.dart' as ll;
 import '../scheduler/thermal_models.dart';
 
 // ── Benchmark prompts ──────────────────────────────────────────────────────────
 
-/// Fixed set of prompts rotated through during the benchmark session.
-/// Kept at similar input token lengths (~30–40 tokens) for fair comparison.
 const List<String> kBenchmarkPrompts = [
   'Explain the concept of thermal throttling in mobile processors in two sentences.',
   'What are the main differences between big and LITTLE CPU cores in ARM architecture?',
@@ -64,9 +63,14 @@ class LlamaEngine extends ChangeNotifier {
   final String _int4Path;
   final String _int8Path;
 
-  // Currently active llama instance (high-level Llama wrapper for synchronous
-  // token-by-token generation in a background isolate pattern).
-  Llama? _activeLlama;
+  /// The llama_cpp_dart 0.9.0 isolate-backed engine.
+  ll.LlamaEngine? _engine;
+
+  /// Active session handle.
+  ll.EngineSession? _session;
+
+  bool _isRunning = false;
+  bool _generationActive = false;
 
   // Current config
   ThermalPolicy _currentPolicy = const ThermalPolicy(
@@ -78,181 +82,177 @@ class LlamaEngine extends ChangeNotifier {
 
   ThermalPolicy get currentPolicy => _currentPolicy;
 
-  bool _isGenerating = false;
-  bool _initialized = false;
-  String _statusMessage = 'Not initialized';
-
-  bool get isGenerating => _isGenerating;
-  bool get isInitialized => _initialized;
-  String get statusMessage => _statusMessage;
-
-  // Latest measured TPS
+  // Benchmark state
+  int _promptIndex = 0;
   double _lastTps = 0.0;
+  final List<InferenceResult> _results = [];
+  bool _stopRequested = false;
+
+  List<InferenceResult> get results => List.unmodifiable(_results);
   double get lastTps => _lastTps;
+  bool get isRunning => _isRunning;
 
-  // Session cancellation
-  bool _cancelRequested = false;
+  // Callbacks
+  void Function(InferenceResult)? onResult;
+  void Function(String)? onError;
 
-  // ── Init ──────────────────────────────────────────────────────────────────────
+  // ── Lifecycle ───────────────────────────────────────────────────────────────
 
-  /// Initializes the engine with the COOL policy (INT8, full threads).
-  Future<void> initialize(ThermalPolicy initialPolicy) async {
-    _currentPolicy = initialPolicy;
-    await _loadModel(initialPolicy);
-    _initialized = true;
-    _statusMessage = 'Ready';
-    notifyListeners();
+  Future<void> initialize() async {
+    await _loadEngine(_currentPolicy);
   }
 
-  // ── Policy application ────────────────────────────────────────────────────────
+  Future<void> _loadEngine(ThermalPolicy policy) async {
+    // Tear down previous engine if any
+    await _teardown();
 
-  /// Called by ThermalScheduler when the policy changes.
-  /// Reloads the model if thread count or quant tier changed.
-  Future<void> applyPolicy(ThermalPolicy policy) async {
-    final bool quantChanged = policy.quant != _currentPolicy.quant;
-    final bool threadsChanged = policy.threads != _currentPolicy.threads;
-    final bool ctxChanged = policy.ctxLen != _currentPolicy.ctxLen;
-
-    _currentPolicy = policy;
-
-    if (quantChanged || threadsChanged || ctxChanged) {
-      _statusMessage = 'Reloading model (${policy.quant.displayName}, '
-          '${policy.threads}t, ctx=${policy.ctxLen})…';
-      notifyListeners();
-      await _reloadModel(policy);
-      _statusMessage = 'Running (${policy.state.displayName})';
-      notifyListeners();
-    }
-  }
-
-  // ── Benchmark loop ────────────────────────────────────────────────────────────
-
-  /// Runs a rotating prompt loop for [duration], yielding an [InferenceResult]
-  /// for each completed inference. Cancelled by calling [cancelSession].
-  Stream<InferenceResult> runBenchmarkLoop(Duration duration) async* {
-    if (!_initialized || _activeLlama == null) {
-      debugPrint('LlamaEngine: not initialized');
-      return;
-    }
-    _cancelRequested = false;
-    final deadline = DateTime.now().add(duration);
-    int promptIndex = 0;
-
-    while (DateTime.now().isBefore(deadline) && !_cancelRequested) {
-      final prompt = kBenchmarkPrompts[promptIndex % kBenchmarkPrompts.length];
-      promptIndex++;
-
-      final result = await _runSingleInference(prompt, promptIndex - 1);
-      if (result != null) {
-        _lastTps = result.tokensPerSec;
-        notifyListeners();
-        yield result;
-      }
-
-      // Brief pause between prompts to let the scheduler tick
-      await Future.delayed(const Duration(milliseconds: 200));
-    }
-  }
-
-  void cancelSession() {
-    _cancelRequested = true;
-  }
-
-  // ── Disposal ───────────────────────────────────────────────────────────────────
-
-  @override
-  void dispose() {
-    _activeLlama?.dispose();
-    _activeLlama = null;
-    super.dispose();
-  }
-
-  // ── Private helpers ──────────────────────────────────────────────────────────
-
-  Future<void> _loadModel(ThermalPolicy policy) async {
-    _activeLlama?.dispose();
-    _activeLlama = null;
-
-    final path = policy.quant == QuantTier.int8 ? _int8Path : _int4Path;
-    debugPrint(
-        'LlamaEngine: loading ${policy.quant.name} model at $path '
-        '(threads=${policy.threads}, ctx=${policy.ctxLen})');
+    final modelPath = policy.quant == QuantTier.int4 ? _int4Path : _int8Path;
+    debugPrint('[LlamaEngine] Loading model: $modelPath '
+        'threads=${policy.threads} ctx=${policy.ctxLen}');
 
     try {
-      final ctxParams = ContextParams()
-          ..nCtx = policy.ctxLen
-          ..nThreads = policy.threads
-          ..nThreadsBatch = policy.threads;
-
-      final llama = Llama(
-        path,
-        modelParams: ModelParams()..nGpuLayers = 0, // CPU only on mobile
-        contextParams: ctxParams,
-        samplerParams: SamplerParams()..temp = 0.7,
+      _engine = await ll.LlamaEngine.spawn(
+        modelParams: ll.ModelParams(path: modelPath),
+        contextParams: ll.ContextParams(
+          nCtx: policy.ctxLen,
+          nThreads: policy.threads,
+          nThreadsBatch: policy.threads,
+        ),
       );
-      _activeLlama = llama;
+      _session = await _engine!.createSession();
+      debugPrint('[LlamaEngine] Engine ready.');
     } catch (e) {
-      _statusMessage = 'Error loading model: $e';
-      debugPrint('LlamaEngine error: $e');
-      notifyListeners();
+      debugPrint('[LlamaEngine] Failed to load engine: $e');
+      onError?.call('Failed to load model: $e');
       rethrow;
     }
   }
 
-  Future<void> _reloadModel(ThermalPolicy policy) async {
-    _isGenerating = false;
-    await _loadModel(policy);
+  Future<void> _teardown() async {
+    _generationActive = false;
+    try {
+      await _session?.dispose();
+    } catch (_) {}
+    try {
+      await _engine?.dispose();
+    } catch (_) {}
+    _session = null;
+    _engine = null;
   }
 
-  Future<InferenceResult?> _runSingleInference(
-      String prompt, int promptIdx) async {
-    if (_activeLlama == null || _cancelRequested) return null;
+  // ── Policy changes (called by ThermalScheduler) ───────────────────────────
 
-    _isGenerating = true;
+  Future<void> onPolicyChanged(ThermalPolicy newPolicy) async {
+    final oldPolicy = _currentPolicy;
+    _currentPolicy = newPolicy;
+
+    final needsReload = newPolicy.quant != oldPolicy.quant ||
+        newPolicy.threads != oldPolicy.threads ||
+        newPolicy.ctxLen != oldPolicy.ctxLen;
+
+    if (!needsReload) return;
+
+    debugPrint('[LlamaEngine] Policy change → quant=${newPolicy.quant.name} '
+        'threads=${newPolicy.threads} ctx=${newPolicy.ctxLen}');
+
+    _generationActive = false;
+    await _loadEngine(newPolicy);
+    notifyListeners();
+  }
+
+  // ── Benchmark loop ─────────────────────────────────────────────────────────
+
+  Future<void> startBenchmarkLoop() async {
+    _isRunning = true;
+    _stopRequested = false;
     notifyListeners();
 
-    final buffer = StringBuffer();
+    while (!_stopRequested) {
+      if (_session == null || _engine == null) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        continue;
+      }
+
+      final prompt =
+          kBenchmarkPrompts[_promptIndex % kBenchmarkPrompts.length];
+      _promptIndex++;
+
+      await _runSingleInference(prompt);
+    }
+
+    _isRunning = false;
+    notifyListeners();
+  }
+
+  Future<void> _runSingleInference(String prompt) async {
+    final session = _session;
+    if (session == null) return;
+
+    _generationActive = true;
     final sw = Stopwatch()..start();
+    final buffer = StringBuffer();
     int tokenCount = 0;
 
     try {
-      _activeLlama!.setPrompt(prompt);
+      final stream = session.generate(
+        prompt: prompt,
+        addSpecial: true,
+        sampler: const ll.SamplerParams(temperature: 0.7, topP: 0.95),
+        maxTokens: 128,
+      );
 
-      while (!_cancelRequested) {
-        final (String token, bool done) = _activeLlama!.getNext();
-        buffer.write(token);
-        tokenCount++;
-        if (done) break;
+      await for (final event in stream) {
+        if (!_generationActive || _stopRequested) break;
 
-        // Yield to event loop periodically so UI stays responsive
-        if (tokenCount % 10 == 0) {
-          await Future.delayed(Duration.zero);
+        if (event is ll.TokenEvent) {
+          buffer.write(event.text);
+          tokenCount++;
+        } else if (event is ll.DoneEvent) {
+          break;
         }
       }
     } catch (e) {
-      debugPrint('LlamaEngine inference error: $e');
-      _isGenerating = false;
-      notifyListeners();
-      return null;
+      debugPrint('[LlamaEngine] Generation error: $e');
+      if (_stopRequested) return;
+      onError?.call('Inference error: $e');
+      return;
+    } finally {
+      _generationActive = false;
     }
 
     sw.stop();
-    _isGenerating = false;
-    notifyListeners();
+    if (tokenCount == 0 || _stopRequested) return;
 
-    final elapsedSec = sw.elapsedMilliseconds / 1000.0;
-    final tps = elapsedSec > 0 ? tokenCount / elapsedSec : 0.0;
+    final elapsed = sw.elapsed;
+    final tps = tokenCount / elapsed.inMilliseconds * 1000.0;
+    _lastTps = tps;
 
-    return InferenceResult(
-      promptIndex: promptIdx,
+    final result = InferenceResult(
+      promptIndex: _promptIndex - 1,
       promptText: prompt,
       responseText: buffer.toString(),
       tokensPerSec: tps,
       tokenCount: tokenCount,
-      elapsed: sw.elapsed,
+      elapsed: elapsed,
       stateAtGeneration: _currentPolicy.state,
       quantAtGeneration: _currentPolicy.quant,
       threadsAtGeneration: _currentPolicy.threads,
     );
+
+    _results.add(result);
+    onResult?.call(result);
+    notifyListeners();
+  }
+
+  void stop() {
+    _stopRequested = true;
+    _generationActive = false;
+  }
+
+  @override
+  Future<void> dispose() async {
+    stop();
+    await _teardown();
+    super.dispose();
   }
 }

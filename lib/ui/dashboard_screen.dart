@@ -93,19 +93,17 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     // Wire scheduler → engine
     _scheduler.onPolicyChanged = (policy) {
-      _engine.applyPolicy(policy);
+      _engine.onPolicyChanged(policy);
     };
 
-    // Initialise with COOL policy
-    final initialPolicy = ThermalPolicy(
-      state: ThermalState.cool,
-      threads: 4,
-      quant: widget.isBaseline ? QuantTier.int8 : QuantTier.int8,
-      ctxLen: kCoolCtxLen,
-    );
+    // Wire engine result callback → chart updates
+    _engine.onResult = _onInferenceResult;
+    _engine.onError = (e) {
+      if (mounted) _showError(e);
+    };
 
     try {
-      await _engine.initialize(initialPolicy);
+      await _engine.initialize();
     } catch (e) {
       if (mounted) {
         _showError('Failed to load model: $e');
@@ -136,10 +134,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     // Listen for scheduler sensor updates to update charts
     _scheduler.addListener(_onSchedulerUpdate);
 
-    // Start inference loop
-    _inferenceSubscription = _engine
-        .runBenchmarkLoop(_sessionDuration)
-        .listen(_onInferenceResult, onDone: _endSession);
+    // Start inference loop (runs until stop() is called)
+    _engine.startBenchmarkLoop();
   }
 
   void _onSchedulerUpdate() {
@@ -181,7 +177,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     _inferenceSubscription?.cancel();
     _scheduler.stop();
     _clockTimer?.cancel();
-    _engine.cancelSession();
+    _engine.stop();
 
     if (!_sessionEnded && mounted) {
       setState(() => _sessionEnded = true);
