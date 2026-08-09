@@ -1,222 +1,184 @@
-# ThermalPilot
+# ThermalPilot 🌡️🤖
 
-> **A thermal-and-battery-aware on-device LLM inference scheduler for Android.**  
-> Keeps tokens/sec stable under SoC thermal throttling by dynamically adjusting thread count, quantization tier, and context length — all while running a real-time live dashboard.
+> **A thermal-and-battery-aware on-device LLM inference scheduler and chat interface for Android.**
+
+ThermalPilot dynamically adjusts thread count, quantization tier (INT4 ↔ INT8), and context length in real-time based on your Android device's SoC temperature and battery state. It keeps tokens/sec stable under thermal throttling instead of letting performance collapse, all while running a real-time live dashboard and an interactive on-device chat.
+
+Built with **Flutter**, **Dart**, **Kotlin**, and **llama_cpp_dart (0.9.0-dev)**.
 
 ---
 
-## Architecture
+## ✨ Features
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Flutter UI (Dart)                                          │
-│  ┌──────────────┐  ┌───────────────────┐  ┌─────────────┐  │
-│  │  HomeScreen  │  │  DashboardScreen  │  │SummaryScreen│  │
-│  └──────────────┘  └───────────────────┘  └─────────────┘  │
-│           fl_chart time-series (TPS / Temp / Policy)        │
-│                                                             │
-│  ┌─────────────────────────┐   ┌──────────────────────┐     │
-│  │  ThermalScheduler (FSM) │   │  LlamaEngine         │     │
-│  │  2-second Timer loop    │──▶│  llama_cpp_dart       │     │
-│  │  COOL/WARM/HOT/CRITICAL │   │  INT4 ↔ INT8 hot-swap│     │
-│  └────────────┬────────────┘   └──────────────────────┘     │
-│               │ MethodChannel                               │
-│  ─────────────┼────────────────────────────── NATIVE ─────  │
-│               ▼                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  MainActivity.kt  (Kotlin)                           │   │
-│  │  • PowerManager.addThermalStatusListener (API 29+)   │   │
-│  │  • /sys/class/thermal/thermal_zone*/temp (fallback)  │   │
-│  │  • BatteryManager ACTION_BATTERY_CHANGED             │   │
-│  │  • /sys/devices/system/cpu/*/cpufreq/scaling_max_freq│   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+- **Adaptive Inference Scheduler**: A Finite State Machine (FSM) that monitors thermal zones and automatically scales back performance before the OS forcefully throttles the CPU.
+- **Hot-Swapping Quantization**: Seamlessly switches between high-precision INT8 models (when cool) and low-memory INT4 models (when hot).
+- **Interactive On-Device Chat**: A full chat interface with streaming tokens, typing indicators, context shifting, and live thermal badges. No internet required!
+- **Built-in Model Downloader**: Paste a HuggingFace URL and download `.gguf` files directly into the app with a real-time progress bar and auto-resume support.
+- **Live Telemetry Dashboard**: Real-time `fl_chart` graphs tracking Tokens Per Second (TPS), SoC Temperature, Battery Temperature, and Scheduler Policy states.
+- **Benchmark Mode**: Compare the adaptive scheduler against a static "Baseline" mode over a 20-minute session and export the data to CSV.
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD
+    subgraph Flutter UI Dart
+        HS[HomeScreen]
+        DS[DashboardScreen]
+        CS[ChatScreen]
+        SS[SummaryScreen]
+    end
+
+    subgraph Core Logic
+        TS[ThermalScheduler FSM]
+        LE[LlamaEngine 0.9.0]
+        MD[ModelDownloader]
+    end
+
+    subgraph Native Android Kotlin
+        MA[MainActivity.kt]
+    end
+
+    HS -->|URL / Path| MD
+    HS -->|Start Session| DS
+    HS -->|Start Chat| CS
+    DS -->|Policy Change| TS
+    TS -->|Thermal/Battery Data| MA
+    TS -->|Policy Update| LE
+    CS -->|Prompt/Stream| LE
+    LE -->|Native FFI| LCP[llama.cpp]
+    MA -->|MethodChannel| TS
+
+    style LE fill:#673ab7,stroke:#fff,stroke-width:2px,color:#fff
+    style TS fill:#3f51b5,stroke:#fff,stroke-width:2px,color:#fff
+    style MA fill:#4caf50,stroke:#fff,stroke-width:2px,color:#fff
 ```
 
 ### Scheduler State Machine
 
-```
-            ┌──── 2 consecutive hotter readings ────►
-  COOL ──────┤                                        WARM
-            └──── 3 consecutive cooler readings ─────
-  
-            ┌──── 2 consecutive hotter readings ────►
-  WARM ──────┤                                        HOT
-            └──── 3 consecutive cooler readings ─────
-  
-            ┌──── 2 consecutive hotter readings ────►
-  HOT  ──────┤                                        CRITICAL
-            └──── 3 consecutive cooler readings ─────
-```
+| State | Threads | Quant Tier | Context Length | Trigger Condition | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **COOL** | `4` (Big cores) | **INT8** | `4096` | Default / Status 0 | Full performance |
+| **WARM** | `3` (Reduced) | **INT8** | `2048` | Status 1 or > 39°C | Slight reduction |
+| **HOT** | `2` (Little cores) | **INT4** | `1024` | Status 2 or > 42°C | Aggressive thermal savings |
+| **CRITICAL** | `1` (Minimal) | **INT4** | `512` | Status 3/4 or > 45°C | Survival mode |
 
-| State    | Threads      | Quant | Context | Notes                          |
-|----------|-------------|-------|---------|--------------------------------|
-| COOL     | All big cores| INT8  | 4096    | Full performance               |
-| WARM     | Big-1        | INT8  | 2048    | Slightly reduced               |
-| HOT      | Little cores | INT4  | 1024    | Aggressive reduction           |
-| CRITICAL | 1            | INT4  | 512     | UI warning shown               |
+*Hysteresis is built-in: The scheduler requires 2 consecutive hotter readings to downgrade performance, and 3 consecutive cooler readings to upgrade, preventing rapid oscillation (thrashing).*
 
 ---
 
-## Project Structure
-
-```
-lib/
-├── main.dart                        # App entry, theme, routes
-├── native/
-│   └── thermal_channel.dart         # MethodChannel Dart wrapper
-├── scheduler/
-│   ├── thermal_scheduler.dart       # FSM + policy (all constants here)
-│   └── session_logger.dart          # CSV logging + stats
-├── inference/
-│   └── llama_engine.dart            # llama_cpp_dart wrapper, hot-swap
-└── ui/
-    ├── home_screen.dart             # Mode select, model paths, start
-    ├── dashboard_screen.dart        # Live fl_chart dashboard
-    └── summary_screen.dart          # Stats, CSV export
-
-android/app/src/main/kotlin/com/thermalpilot/thermal_pilot/
-└── MainActivity.kt                  # Kotlin native: thermal/battery/CPU
-```
-
----
-
-## Setup & Build
+## 🚀 Setup & Installation
 
 ### Prerequisites
 
-| Tool | Version |
-|------|---------|
-| Flutter SDK | ≥ 3.19 |
-| Dart SDK | ≥ 3.3 |
-| Android NDK | ≥ r25 (via Android Studio) |
-| Target device | ARM64 Android, API 29+ (Android 10+) |
+- **Flutter SDK**: `≥ 3.19`
+- **Dart SDK**: `≥ 3.3`
+- **Android Studio / NDK**: Required for building the Android APK.
+- **Target Device**: ARM64 Android device (API 29+ recommended for `PowerManager.addThermalStatusListener`).
 
-### 1. Clone & install dependencies
+### 1. Clone & Install Dependencies
 
 ```bash
-git clone <your-repo-url> ThermalPilot
+git clone https://github.com/LonelyGuy12/ThermalPilot.git
 cd ThermalPilot
 flutter pub get
 ```
 
-### 2. Download GGUF model files
-
-ThermalPilot requires **two** quantizations of a small model. We recommend Qwen2.5-0.5B-Instruct:
-
-**INT4 model (Q4_K_M, ~397 MB):**
-```
-https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
-```
-
-**INT8 model (Q8_0, ~531 MB):**
-```
-https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
-```
-
-Download them to your Android device:
+### 2. Build and Install the APK
 
 ```bash
-# On your device or via adb:
-adb shell mkdir -p /sdcard/Download
-adb push qwen2.5-0.5b-instruct-q4_k_m.gguf /sdcard/Download/
-adb push qwen2.5-0.5b-instruct-q8_0.gguf /sdcard/Download/
-```
+# Build the release APK
+flutter build apk --release
 
-### 3. Build and install the APK
-
-```bash
-flutter build apk --release --target-platform android-arm64
+# Install on connected device
 adb install build/app/outputs/flutter-apk/app-release.apk
+
+# OR run in debug mode for development
+flutter run
 ```
 
-Or for a debug build during development:
-```bash
-flutter run --device-id <your-device-id>
-```
+### 3. In-App Setup (Downloading Models)
 
-### 4. In-app setup
+ThermalPilot can download models directly from HuggingFace. We recommend using **Qwen2.5-0.5B-Instruct**.
 
-1. Open **ThermalPilot**
-2. Tap **INT4 Model** → enter path: `/sdcard/Download/qwen2.5-0.5b-instruct-q4_k_m.gguf`
-3. Tap **INT8 Model** → enter path: `/sdcard/Download/qwen2.5-0.5b-instruct-q8_0.gguf`
-4. Select **ThermalPilot** or **Baseline** mode
-5. Tap **Start 20-min Session**
+1. Open **ThermalPilot** on your phone.
+2. Tap the **INT4 Model** card. A bottom sheet will appear.
+3. Paste the HuggingFace URL for the `Q4_K_M` model (or use the pre-filled default) and tap **Download**.
+   *URL: `https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf`*
+4. Repeat for the **INT8 Model** card using the `Q8_0` model.
+   *URL: `https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf`*
 
-### 5. Exporting results
-
-After each session, the Summary screen shows per-session stats. Tap **Export CSV** to save and share a full time-series log including timestamps, TPS, temps, policy state, thread count, quant tier, and context length.
+*(Note: If you only download one model, ThermalPilot will automatically use it for both tiers, allowing you to start sessions immediately!)*
 
 ---
 
-## Tuning Policy Thresholds
+## 📊 Using the App
 
-All thresholds are named constants at the top of [`lib/scheduler/thermal_scheduler.dart`](lib/scheduler/thermal_scheduler.dart):
+### Chat Mode
+Tap **"Chat with Model"** on the home screen to launch the interactive AI chat.
+- **Fully On-Device**: No data leaves your phone.
+- **Streaming UI**: Tokens appear in real-time.
+- **Live Thermals**: The App Bar displays a badge indicating your phone's current thermal state.
+
+### Benchmark Mode
+1. Ensure models are downloaded.
+2. Select either **ThermalPilot** (Adaptive Scheduler) or **Baseline** (Max threads, fixed INT8).
+3. Tap **Start 20-min Session**.
+4. Watch the live telemetry on the **Dashboard**.
+5. Once the session ends, review the **Summary Screen** and export the run to a CSV file for analysis.
+
+---
+
+## 🛠️ Project Structure
+
+```text
+lib/
+├── inference/
+│   └── llama_engine.dart            # llama_cpp_dart 0.9.0 isolate-backed engine
+├── native/
+│   └── thermal_channel.dart         # MethodChannel for Android sensors
+├── scheduler/
+│   ├── session_logger.dart          # CSV logging & statistics
+│   ├── thermal_models.dart          # Enums and state definitions
+│   └── thermal_scheduler.dart       # FSM logic and sensor polling
+├── ui/
+│   ├── chat_screen.dart             # Interactive streaming chat UI
+│   ├── dashboard_screen.dart        # Live fl_chart telemetry
+│   ├── home_screen.dart             # Entry point & downloader UI
+│   └── summary_screen.dart          # Post-benchmark results & CSV export
+└── utils/
+    └── model_downloader.dart        # HTTP robust downloader with auto-resume
+
+android/app/src/main/kotlin/.../
+└── MainActivity.kt                  # Kotlin: PowerManager API, sysfs parsing, BatteryManager
+```
+
+---
+
+## ⚙️ Advanced Tuning
+
+You can tweak the scheduler's behavior by modifying the constants at the top of [`lib/scheduler/thermal_scheduler.dart`](lib/scheduler/thermal_scheduler.dart):
 
 ```dart
 const int kWarmStatusThreshold  = 2;  // PowerManager THERMAL_STATUS_MODERATE
 const int kHotStatusThreshold   = 3;  // PowerManager THERMAL_STATUS_SEVERE
 const int kCritStatusThreshold  = 4;  // PowerManager THERMAL_STATUS_CRITICAL
-const int kDowngradeConsecutive = 2;  // readings before hotter transition
-const int kUpgradeConsecutive   = 3;  // readings before cooler transition
+
+// Hysteresis
+const int kDowngradeConsecutive = 2;  // Readings needed to downgrade performance
+const int kUpgradeConsecutive   = 3;  // Readings needed to upgrade performance
+
+// Context Window Scaling
 const int kCoolCtxLen  = 4096;
 const int kWarmCtxLen  = 2048;
 const int kHotCtxLen   = 1024;
 const int kCritCtxLen  = 512;
 ```
 
-Increase `kDowngradeConsecutive` to make the scheduler less reactive; decrease it to respond faster to heating.
-
 ---
 
-## Benchmark Methodology
+## 📄 License
 
-1. **Baseline run**: Start a 20-min session in **Baseline** mode. Fixed max threads, INT8 model, no scheduler. Record CSV.
-2. **ThermalPilot run**: Start a 20-min session in **ThermalPilot** mode. Adaptive. Record CSV.
-3. Compare the two CSVs (or summary screen stats) for:
-   - Avg TPS — ThermalPilot should be within ±10% of baseline in the first half, then significantly higher in the second half as baseline throttles
-   - P10 TPS (worst-case floor) — ThermalPilot should show a higher floor
-   - Max temperature — ThermalPilot should stay lower
-   - Throttle events — ThermalPilot transitions are *managed* (not crashes)
-
----
-
-## Benchmark Results
-
-> **[PLACEHOLDER — fill in after real device testing]**
-
-### Device: _(e.g. Pixel 8 / Snapdragon 8 Gen 3)_
-
-| Metric | Baseline | ThermalPilot | Δ |
-|--------|---------|--------------|---|
-| Avg tokens/sec | ___ | ___ | ___ |
-| P10 tokens/sec | ___ | ___ | ___ |
-| Max SoC temp (°C) | ___ | ___ | ___ |
-| Max batt temp (°C) | ___ | ___ | ___ |
-| Throttle events | ___ | ___ | ___ |
-
-### Charts
-
-> _(Insert screenshot of fl_chart dashboard comparison here)_
-
-### Observations
-
-> _(Notes on thermal behavior, which SoC features triggered PowerManager status changes, etc.)_
-
----
-
-## Troubleshooting
-
-| Issue | Fix |
-|-------|-----|
-| "Failed to load model" | Check model path; ensure `/sdcard/Download/*.gguf` exists |
-| Thermal status always 0 | Normal on some emulators; sysfs fallback activates automatically |
-| Build fails with NDK error | Run `flutter doctor`, ensure NDK r25+ installed via Android Studio SDK Manager |
-| Very low TPS on first run | GGUF models cold-load into RAM; subsequent prompts are faster |
-| `MANAGE_EXTERNAL_STORAGE` dialog | Accept the permission to allow reading GGUF files from Downloads |
-
----
-
-## License
-
-MIT License. llama.cpp is MIT. Qwen2.5 model weights are under [Qwen License](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/LICENSE).
+This project is licensed under the MIT License.
+Powered by [llama_cpp_dart](https://pub.dev/packages/llama_cpp_dart) and the incredible [llama.cpp](https://github.com/ggerganov/llama.cpp) project.
