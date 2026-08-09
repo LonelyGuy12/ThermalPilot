@@ -20,7 +20,7 @@ dependencies:
   path_provider: ^2.1.5
 
   # File sharing / export
-  share_plus: ^10.0.0
+  share_plus: ^10.1.4
 
   # Permissions (storage for file picker)
   permission_handler: ^11.3.1

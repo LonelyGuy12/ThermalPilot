@@ -57,15 +57,20 @@ class _HomeScreenState extends State<HomeScreen>
     super.dispose();
   }
 
-  bool get _canStart => _int4ModelPath != null && _int8ModelPath != null;
+  bool get _canStart => _int4ModelPath != null || _int8ModelPath != null;
+
+  // If only one model is downloaded, use it for both tiers.
+  String get _resolvedInt4Path => _int4ModelPath ?? _int8ModelPath!;
+  String get _resolvedInt8Path => _int8ModelPath ?? _int4ModelPath!;
+  bool get _usingSingleModel => _int4ModelPath == null || _int8ModelPath == null;
 
   void _startSession() {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => DashboardScreen(
           isBaseline: _isBaselineMode,
-          int4ModelPath: _int4ModelPath!,
-          int8ModelPath: _int8ModelPath!,
+          int4ModelPath: _resolvedInt4Path,
+          int8ModelPath: _resolvedInt8Path,
         ),
       ),
     );
@@ -150,6 +155,9 @@ class _HomeScreenState extends State<HomeScreen>
                   _buildModelCard(
                     label: 'INT4 Model (Q4_K_M)',
                     path: _int4ModelPath,
+                    fallbackNote: _int4ModelPath == null && _int8ModelPath != null
+                        ? 'Using INT8 model as fallback'
+                        : null,
                     color: Colors.orangeAccent,
                     icon: Icons.compress,
                     onTap: () => _showModelDialog(isInt4: true),
@@ -158,6 +166,9 @@ class _HomeScreenState extends State<HomeScreen>
                   _buildModelCard(
                     label: 'INT8 Model (Q8_0)',
                     path: _int8ModelPath,
+                    fallbackNote: _int8ModelPath == null && _int4ModelPath != null
+                        ? 'Using INT4 model as fallback'
+                        : null,
                     color: Colors.cyanAccent,
                     icon: Icons.memory,
                     onTap: () => _showModelDialog(isInt4: false),
@@ -371,8 +382,10 @@ class _HomeScreenState extends State<HomeScreen>
     required Color color,
     required IconData icon,
     required VoidCallback onTap,
+    String? fallbackNote,
   }) {
     final bool isSet = path != null;
+    final bool isFallback = path == null && fallbackNote != null;
     return GestureDetector(
       onTap: onTap,
       child: Container(
@@ -381,9 +394,12 @@ class _HomeScreenState extends State<HomeScreen>
           color: const Color(0xFF161B27),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
-              color: isSet
-                  ? color.withValues(alpha: 0.5)
-                  : Colors.white12),
+            color: isSet
+                ? color.withValues(alpha: 0.5)
+                : isFallback
+                    ? Colors.amber.withValues(alpha: 0.4)
+                    : Colors.white12,
+          ),
         ),
         child: Row(
           children: [
@@ -391,12 +407,23 @@ class _HomeScreenState extends State<HomeScreen>
               width: 40,
               height: 40,
               decoration: BoxDecoration(
-                color:
-                    (isSet ? color : Colors.white24).withValues(alpha: 0.12),
+                color: (isSet
+                        ? color
+                        : isFallback
+                            ? Colors.amber
+                            : Colors.white24)
+                    .withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child:
-                  Icon(icon, color: isSet ? color : Colors.white38, size: 22),
+              child: Icon(
+                icon,
+                color: isSet
+                    ? color
+                    : isFallback
+                        ? Colors.amber
+                        : Colors.white38,
+                size: 22,
+              ),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -405,20 +432,27 @@ class _HomeScreenState extends State<HomeScreen>
                 children: [
                   Text(label,
                       style: TextStyle(
-                          color: isSet ? Colors.white : Colors.white54,
+                          color: isSet
+                              ? Colors.white
+                              : isFallback
+                                  ? Colors.white70
+                                  : Colors.white54,
                           fontWeight: FontWeight.w600,
                           fontSize: 14)),
                   const SizedBox(height: 3),
                   Text(
                     isSet
                         ? path.split('/').last
-                        : 'Tap to download or set path',
+                        : (fallbackNote ?? 'Tap to download or set path'),
                     style: TextStyle(
-                        color: isSet
-                            ? color.withValues(alpha: 0.8)
-                            : Colors.white24,
-                        fontSize: 12,
-                        fontFamily: 'monospace'),
+                      color: isSet
+                          ? color.withValues(alpha: 0.8)
+                          : isFallback
+                              ? Colors.amber.withValues(alpha: 0.8)
+                              : Colors.white24,
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                    ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -426,8 +460,16 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
             Icon(
-              isSet ? Icons.check_circle : Icons.download_rounded,
-              color: isSet ? color : Colors.white24,
+              isSet
+                  ? Icons.check_circle
+                  : isFallback
+                      ? Icons.warning_amber_rounded
+                      : Icons.download_rounded,
+              color: isSet
+                  ? color
+                  : isFallback
+                      ? Colors.amber
+                      : Colors.white24,
               size: 22,
             ),
           ],
@@ -477,14 +519,19 @@ class _HomeScreenState extends State<HomeScreen>
             children: [
               const Icon(Icons.play_circle_fill, size: 24),
               const SizedBox(width: 10),
-              Text(
-                _isBaselineMode
-                    ? 'Start 20-min Baseline Session'
-                    : 'Start 20-min ThermalPilot Session',
-                style: const TextStyle(
+              Flexible(
+                child: Text(
+                  _usingSingleModel
+                      ? 'Start Session (1 model)'
+                      : _isBaselineMode
+                          ? 'Start 20-min Baseline Session'
+                          : 'Start 20-min ThermalPilot Session',
+                  style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
                     letterSpacing: 0.5),
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
             ],
           ),
