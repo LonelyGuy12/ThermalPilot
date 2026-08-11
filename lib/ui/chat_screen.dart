@@ -43,10 +43,18 @@ class _ChatScreenState extends State<ChatScreen> {
   ll.EngineChat? _chat;
   StreamSubscription<ll.GenerationEvent>? _genSub;
 
-  // Thermal channel (for the app bar badge)
+  // Scaffold key for hamburger drawer
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  // Thermal channel
   final _thermalChannel = ThermalChannel();
-  int _thermalStatus = 0; // 0=cool, 1=light, 2=moderate, 3=severe, 4=critical
   Timer? _thermalTimer;
+
+  // Full telemetry state
+  int _thermalStatus = 0;
+  BatteryInfo _battery = BatteryInfo(level: -1, tempC: 0);
+  List<int> _cpuTopology = [];
+  Map<String, int> _sysfsTemps = {};
 
   // UI state
   final List<_ChatMessage> _messages = [];
@@ -67,8 +75,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _refreshThermal() async {
     try {
-      final status = await _thermalChannel.getThermalStatus();
-      if (mounted) setState(() => _thermalStatus = status);
+      final results = await Future.wait([
+        _thermalChannel.getThermalStatus(),
+        _thermalChannel.getBatteryInfo(),
+        _thermalChannel.getCpuTopology(),
+        _thermalChannel.getSysfsTemps(),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _thermalStatus = results[0] as int;
+        _battery = results[1] as BatteryInfo;
+        _cpuTopology = results[2] as List<int>;
+        _sysfsTemps = results[3] as Map<String, int>;
+      });
     } catch (_) {}
   }
 
@@ -212,10 +231,14 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: _scaffoldKey,
       backgroundColor: const Color(0xFF0D1117),
+      endDrawerEnableOpenDragGesture: true,
+      endDrawer: _buildTelemetryDrawer(),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0D1117),
         elevation: 0,
+        automaticallyImplyLeading: false,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.white70),
           onPressed: () => Navigator.pop(context),
@@ -255,9 +278,16 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           // Clear chat button
           IconButton(
-            icon: const Icon(Icons.refresh, color: Colors.white38, size: 20),
+            icon: const Icon(Icons.refresh_rounded,
+                color: Colors.white38, size: 20),
             tooltip: 'Clear chat',
             onPressed: _messages.isEmpty ? null : _clearChat,
+          ),
+          // Telemetry drawer
+          IconButton(
+            icon: const Icon(Icons.menu_rounded, color: Colors.white70),
+            tooltip: 'Telemetry',
+            onPressed: () => _scaffoldKey.currentState?.openEndDrawer(),
           ),
         ],
       ),
@@ -268,6 +298,302 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
     );
+  }
+
+  // ── Telemetry Drawer ──────────────────────────────────────────────────────────
+
+  Widget _buildTelemetryDrawer() {
+    final (stateLabel, stateColor) = switch (_thermalStatus) {
+      0 => ('COOL', const Color(0xFF4CAF50)),
+      1 => ('LIGHT', const Color(0xFF8BC34A)),
+      2 => ('WARM', const Color(0xFFFFC107)),
+      3 => ('HOT', const Color(0xFFFF5722)),
+      _ => ('CRITICAL', const Color(0xFFF44336)),
+    };
+
+    // Compute top sysfs zones for display (up to 5, ignore zeros)
+    final topZones = _sysfsTemps.entries
+        .where((e) => e.value > 10000) // > 10°C in milli-°C
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final displayZones = topZones.take(5).toList();
+
+    return Drawer(
+      backgroundColor: const Color(0xFF0D1117),
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header
+            Container(
+              width: double.infinity,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+              decoration: BoxDecoration(
+                color: stateColor.withValues(alpha: 0.08),
+                border: Border(
+                    bottom: BorderSide(
+                        color: stateColor.withValues(alpha: 0.25))),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.thermostat_rounded,
+                          color: stateColor, size: 22),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Device Telemetry',
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Live readings • updates every 3s',
+                    style:
+                        TextStyle(color: Colors.white38, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  // ── Thermal Status ──────────────────────────────────────
+                  _drawerSection(
+                    icon: Icons.device_thermostat_rounded,
+                    label: 'Thermal Status',
+                    child: _statusPill(stateLabel, stateColor),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // ── Battery ──────────────────────────────────────────────
+                  _drawerSection(
+                    icon: Icons.battery_charging_full_rounded,
+                    label: 'Battery',
+                    child: Column(
+                      children: [
+                        _telemetryRow(
+                          'Level',
+                          _battery.level >= 0
+                              ? '${_battery.level}%'
+                              : '—',
+                          _batteryColor(_battery.level),
+                        ),
+                        const SizedBox(height: 8),
+                        _telemetryRow(
+                          'Temperature',
+                          _battery.tempC > 0
+                              ? '${_battery.tempC.toStringAsFixed(1)} °C'
+                              : '—',
+                          _tempColor(_battery.tempC),
+                        ),
+                        if (_battery.level >= 0) ...[  
+                          const SizedBox(height: 10),
+                          _progressBar(
+                            value: _battery.level / 100.0,
+                            color: _batteryColor(_battery.level),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // ── CPU Cores ────────────────────────────────────────────
+                  _drawerSection(
+                    icon: Icons.memory_rounded,
+                    label: 'CPU Cores',
+                    child: _cpuTopology.isEmpty
+                        ? const Text('—',
+                            style: TextStyle(color: Colors.white38))
+                        : Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: _cpuTopology
+                                .asMap()
+                                .entries
+                                .map((e) => _corePill(
+                                      'CPU${e.value}',
+                                      isBig: e.key <
+                                          (_cpuTopology.length / 2).ceil(),
+                                    ))
+                                .toList(),
+                          ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // ── Thermal Zones (sysfs) ────────────────────────────────
+                  _drawerSection(
+                    icon: Icons.whatshot_rounded,
+                    label: 'Thermal Zones',
+                    child: displayZones.isEmpty
+                        ? const Text(
+                            'No sysfs data (locked on Android 10+)',
+                            style: TextStyle(
+                                color: Colors.white38, fontSize: 12),
+                          )
+                        : Column(
+                            children: displayZones
+                                .map((e) => Padding(
+                                      padding: const EdgeInsets.only(
+                                          bottom: 8),
+                                      child: _telemetryRow(
+                                        e.key,
+                                        '${(e.value / 1000).toStringAsFixed(1)} °C',
+                                        _tempColor(
+                                            e.value / 1000.0),
+                                      ),
+                                    ))
+                                .toList(),
+                          ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Refresh button
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _refreshThermal,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white60,
+                    side: const BorderSide(color: Colors.white12),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                  icon: const Icon(Icons.refresh_rounded, size: 18),
+                  label: const Text('Refresh Now'),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Drawer helpers ────────────────────────────────────────────────────────────
+
+  Widget _drawerSection({
+    required IconData icon,
+    required String label,
+    required Widget child,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B27),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: Colors.white38, size: 16),
+              const SizedBox(width: 6),
+              Text(
+                label.toUpperCase(),
+                style: const TextStyle(
+                    color: Colors.white38,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          child,
+        ],
+      ),
+    );
+  }
+
+  Widget _telemetryRow(String label, String value, Color color) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label,
+            style: const TextStyle(color: Colors.white54, fontSize: 13),
+            overflow: TextOverflow.ellipsis),
+        Text(value,
+            style: TextStyle(
+                color: color, fontSize: 14, fontWeight: FontWeight.w700)),
+      ],
+    );
+  }
+
+  Widget _statusPill(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+            color: color, fontSize: 13, fontWeight: FontWeight.w700),
+      ),
+    );
+  }
+
+  Widget _progressBar({required double value, required Color color}) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(4),
+      child: LinearProgressIndicator(
+        value: value.clamp(0.0, 1.0),
+        backgroundColor: color.withValues(alpha: 0.12),
+        valueColor: AlwaysStoppedAnimation<Color>(color),
+        minHeight: 6,
+      ),
+    );
+  }
+
+  Widget _corePill(String label, {required bool isBig}) {
+    final color =
+        isBig ? Colors.deepPurpleAccent : Colors.blueGrey;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+            color: color, fontSize: 11, fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+
+  Color _tempColor(double c) {
+    if (c <= 0) return Colors.white38;
+    if (c < 38) return const Color(0xFF4CAF50);
+    if (c < 42) return const Color(0xFFFFC107);
+    if (c < 46) return const Color(0xFFFF5722);
+    return const Color(0xFFF44336);
+  }
+
+  Color _batteryColor(int pct) {
+    if (pct < 0) return Colors.white38;
+    if (pct <= 20) return const Color(0xFFF44336);
+    if (pct <= 40) return const Color(0xFFFF9800);
+    return const Color(0xFF4CAF50);
   }
 
   Widget _buildMessageList() {
